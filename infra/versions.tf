@@ -8,12 +8,12 @@ terraform {
     }
   }
 
-  # For teams, uncomment and configure an S3 backend for shared state.
-  # backend "s3" {
-  #   bucket = "your-tf-state-bucket"
-  #   key    = "churn-predictor/terraform.tfstate"
-  #   region = "us-east-1"
-  # }
+  # Shared state so local bootstrap and CI operate on the same infrastructure.
+  backend "s3" {
+    bucket = "churn-predictor-tfstate-454014151293"
+    key    = "churn-predictor/terraform.tfstate"
+    region = "us-east-1"
+  }
 }
 
 provider "aws" {
