@@ -1,0 +1,64 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "Churn Model Monitoring",
+  "tags": ["mlops", "churn"],
+  "time": {"from": "now-6h", "to": "now"},
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Model Metrics (F1 / ROC-AUC / Accuracy)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}, "overrides": []},
+      "targets": [
+        {"expr": "churn_model_f1_score", "legendFormat": "F1"},
+        {"expr": "churn_model_roc_auc", "legendFormat": "ROC-AUC"},
+        {"expr": "churn_model_accuracy", "legendFormat": "Accuracy"}
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Churn Rate: Predicted vs Actual",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}, "overrides": []},
+      "targets": [
+        {"expr": "churn_model_predicted_rate", "legendFormat": "Predicted"},
+        {"expr": "churn_model_actual_rate", "legendFormat": "Actual"}
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Max PSI (drift)",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [
+        {"color": "green", "value": null},
+        {"color": "yellow", "value": 0.1},
+        {"color": "red", "value": 0.25}
+      ]}}},
+      "targets": [{"expr": "churn_drift_psi_max", "legendFormat": "PSI max"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Drift Features Count",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "targets": [{"expr": "churn_drift_features_count", "legendFormat": "features"}]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Critical Alerts",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [
+        {"color": "green", "value": null},
+        {"color": "red", "value": 1}
+      ]}}},
+      "targets": [{"expr": "churn_model_critical_alerts", "legendFormat": "alerts"}]
+    }
+  ]
+}

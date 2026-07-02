@@ -1,0 +1,352 @@
+name: MLOps Churn Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'data/**'
+      - 'app/**'
+      - 'infra/**'
+      - 'tests/**'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - '.github/workflows/mlops.yml'
+  schedule:
+    - cron: '0 6 * * 1'          # weekly monitoring - Monday 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      model_type:
+        description: 'Model to train'
+        required: false
+        default: 'all'
+        type: choice
+        options: [logistic, random_forest, xgboost, all]
+
+env:
+  MLFLOW_TRACKING_URI: ./mlruns
+  EXPERIMENT_NAME: churn-prediction-fintech
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: churn-predictor-prod
+  ECS_CLUSTER: churn-predictor-prod
+  ECS_SERVICE: churn-predictor-prod-service
+  CLOUDWATCH_NAMESPACE: MLOps/ChurnPredictor
+
+jobs:
+  # ---------------------------------------------------------------- [1] test
+  test:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests + coverage
+        run: pytest --cov=src --cov=app --cov-report=term-missing
+
+  # ------------------------------------------------------------ [2] data-prep
+  data-prep:
+    name: Data Preparation
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Prepare data
+        run: python src/data_prep.py
+      - name: Upload data artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-prep-artifacts
+          path: |
+            data/X_train.csv
+            data/X_test.csv
+            data/y_train.csv
+            data/y_test.csv
+            data/scaler.pkl
+            data/feature_names.csv
+
+  # ---------------------------------------------------------------- [3] train
+  train:
+    name: Modeling
+    runs-on: ubuntu-latest
+    needs: data-prep
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download data artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: data-prep-artifacts
+          path: data/
+      - name: Train model
+        run: python src/train.py --model ${{ github.event.inputs.model_type || 'all' }} --experiment ${{ env.EXPERIMENT_NAME }}
+      - name: Upload MLflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-artifacts
+          path: |
+            mlruns/
+            data/best_model.pkl
+            data/best_model_meta.json
+
+  # ------------------------------------------------------------- [4] register
+  register:
+    name: Evaluation
+    runs-on: ubuntu-latest
+    needs: train
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download data artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: data-prep-artifacts
+          path: data/
+      - name: Download MLflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: train-artifacts
+          path: .
+      - name: Evaluate and register model
+        run: python src/evaluate_and_register.py
+      - name: Upload production artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-artifacts
+          retention-days: 30
+          path: |
+            data/production_model.pkl
+            data/production_model_info.json
+      - name: Metrics summary
+        run: |
+          if [ -f data/best_model_meta.json ]; then
+            echo "## Model Metrics" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat data/best_model_meta.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ----------------------------------------------------------- [5] smoke-test
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: register
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Download production model
+        uses: actions/download-artifact@v4
+        with:
+          name: production-artifacts
+          path: data/
+      - name: Download scaler + feature_names
+        uses: actions/download-artifact@v4
+        with:
+          name: data-prep-artifacts
+          path: data/
+      - name: Verify API starts with the model
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          sleep 8
+          curl -f http://localhost:8000/health    || exit 1
+          curl -f http://localhost:8000/model/info || exit 1
+          echo "Smoke test OK"
+
+  # ---------------------------------------------------------- [6] build-image
+  build-image:
+    name: Build Image → ECR
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download production model
+        uses: actions/download-artifact@v4
+        with:
+          name: production-artifacts
+          path: data/
+      - name: Download scaler + feature_names
+        uses: actions/download-artifact@v4
+        with:
+          name: data-prep-artifacts
+          path: data/
+      - name: Verify artifacts before build
+        run: |
+          for f in data/production_model.pkl data/production_model_info.json \
+                   data/scaler.pkl data/feature_names.csv; do
+            test -f "$f" && echo "OK  $f" || { echo "MISSING  $f"; exit 1; }
+          done
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build, tag and push image
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  # ------------------------------------------------------- [7] deploy-staging
+  deploy-staging:
+    name: Deploy · Staging
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Rolling deploy to ECS (staging)
+        run: |
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+          echo "Staging deploy OK"
+
+  # ---------------------------------------------------- [8] deploy-production
+  deploy-production:
+    name: Deploy · Production
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Rolling deploy to ECS (production)
+        env:
+          NEW_IMAGE: ${{ needs.build-image.outputs.image }}
+        run: |
+          TASK_FAMILY=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER --services $ECS_SERVICE \
+            --query 'services[0].taskDefinition' --output text | sed 's/:[0-9]*$//')
+          NEW_TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" --query 'taskDefinition' \
+            | jq --arg IMAGE "$NEW_IMAGE" \
+              'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
+               | .containerDefinitions[0].image = $IMAGE')
+          NEW_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --task-definition "$NEW_ARN"
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+          echo "Production deploy OK → $NEW_IMAGE"
+
+  # ------------------------------------------------------ [9] terraform-infra
+  terraform-infra:
+    name: Terraform Infra
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.6.6'
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Terraform init
+        run: terraform init
+      - name: Terraform apply
+        run: terraform apply -auto-approve -var="grafana_admin_password=${{ secrets.GRAFANA_ADMIN_PASSWORD }}"
+
+  # ------------------------------------------------------------- [10] monitor
+  monitor:
+    name: Monitoring
+    runs-on: ubuntu-latest
+    needs: [deploy-production, terraform-infra]
+    if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'schedule')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Download data + production artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: data-prep-artifacts
+          path: data/
+      - name: Download production model
+        uses: actions/download-artifact@v4
+        with:
+          name: production-artifacts
+          path: data/
+      - name: Run monitoring (PSI + metrics + alerts)
+        run: |
+          python src/monitor.py \
+            --output reports/monitoring_report.json \
+            --cloudwatch-namespace ${{ env.CLOUDWATCH_NAMESPACE }}
+      - name: Upload monitoring report
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-report
+          retention-days: 90
+          path: reports/
+      - name: Check criticality → trigger retraining
+        id: check
+        run: |
+          REC=$(jq -r '.recommendation' reports/monitoring_report.json)
+          echo "recommendation=$REC" >> $GITHUB_OUTPUT
+          [ "$REC" == "REENTRENAR" ] && echo "::warning::Model degraded, retraining required" || true
+      - name: Trigger retraining pipeline
+        if: steps.check.outputs.recommendation == 'REENTRENAR'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run mlops.yml --ref main -f model_type=all
