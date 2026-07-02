@@ -303,6 +303,9 @@ jobs:
     name: Monitoring
     runs-on: ubuntu-latest
     needs: [deploy-production, terraform-infra]
+    permissions:
+      contents: read
+      actions: write
     if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'schedule')
     steps:
       - uses: actions/checkout@v4
@@ -345,8 +348,10 @@ jobs:
           REC=$(jq -r '.recommendation' reports/monitoring_report.json)
           echo "recommendation=$REC" >> $GITHUB_OUTPUT
           [ "$REC" == "REENTRENAR" ] && echo "::warning::Model degraded, retraining required" || true
-      - name: Trigger retraining pipeline
-        if: steps.check.outputs.recommendation == 'REENTRENAR'
+      # Auto-retrain only on the weekly scheduled monitoring run — never on a
+      # push, otherwise the simulated drift (always REENTRENAR) would loop CI.
+      - name: Trigger retraining pipeline (auto-retrain)
+        if: steps.check.outputs.recommendation == 'REENTRENAR' && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run mlops.yml --ref main -f model_type=all
